@@ -32,6 +32,9 @@ import (
 
 const (
 	hostObjectRequestPrefix          = "host#"
+	importObjectRequestPrefix        = "import#"
+	createObjectRequestPrefix        = "create#"
+	updateObjectRequestPrefix        = "update#"
 	deleteObjectRequestPrefix        = "delete#"
 	pendingDeleteObjectRequestPrefix = "pendingdelete#"
 )
@@ -112,8 +115,8 @@ func (r *SyncController) newSyncContext(ctx context.Context, logName string) *sy
 }
 
 func (r *SyncController) Reconcile(ctx context.Context, origReq ctrl.Request) (_ ctrl.Result, retErr error) {
-	// extract if this was a delete request
-	origReq, syncEventType := fromDeleteRequest(origReq)
+	// extract event type
+	origReq, syncEventType := extractSyncEventType(origReq)
 
 	// determine event source
 	syncEventSource := synccontext.SyncEventSourceVirtual
@@ -145,8 +148,10 @@ func (r *SyncController) Reconcile(ctx context.Context, origReq ctrl.Request) (_
 	// This is FIFO, we use a special mutex for this (fifomu.Mutex)
 	lockKey := vReq.String()
 	r.locker.Lock(lockKey)
+	klog.FromContext(ctx).Info("!!!lock!!!", "lockKey", lockKey)
 	defer func(lockKey string) {
-		_ = r.locker.Unlock(lockKey)
+		err = r.locker.Unlock(lockKey)
+		klog.FromContext(ctx).Info("!!!unlock!!!", "lockKey", lockKey, "err", err)
 	}(lockKey)
 
 	// check if we should skip reconcile
@@ -216,7 +221,15 @@ func (r *SyncController) Reconcile(ctx context.Context, origReq ctrl.Request) (_
 			}
 		}
 
-		if syncEventSource == synccontext.SyncEventSourceVirtual && syncEventType == synccontext.SyncEventTypePendingDelete {
+		_, isImporter := r.syncer.(syncertypes.Importer)
+		if isImporter && syncEventType == synccontext.SyncEventTypeCreate && syncEventSource == synccontext.SyncEventSourceHost {
+			// Skip syncing the object to the virtual cluster because the resource was capable of being imported
+			// but its importer ignored it.
+			return ctrl.Result{}, nil
+		}
+
+		if syncEventType == synccontext.SyncEventTypePendingDelete {
+			// Skip syncing the object to virtual cluster because it's about to be deleted
 			return ctrl.Result{}, nil
 		}
 
@@ -404,62 +417,53 @@ func (r *SyncController) extractRequest(ctx *synccontext.SyncContext, req ctrl.R
 	return req, pReq, nil
 }
 
-func (r *SyncController) enqueueVirtual(_ context.Context, obj client.Object, q workqueue.TypedRateLimitingInterface[ctrl.Request], isDelete, isPendingDelete bool) {
+func (r *SyncController) enqueueVirtual(_ context.Context, obj client.Object, q workqueue.TypedRateLimitingInterface[ctrl.Request], eventType synccontext.SyncEventType) {
 	if obj == nil {
 		return
 	}
 
-	// add a new request for the host object as otherwise this information might be lost after a delete event
-	if isDelete {
-		// add a new request for the virtual object
-		q.Add(toDeleteRequest(reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Namespace: obj.GetNamespace(),
-				Name:      obj.GetName(),
-			},
-		}))
-
-		return
-	}
-
-	// add a new request for the host object as otherwise this information might be lost after update + delete event
-	if isPendingDelete {
-		// add a new request for the virtual object
-		q.Add(toPendingDeleteRequest(reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Namespace: obj.GetNamespace(),
-				Name:      obj.GetName(),
-			},
-		}))
-
-		return
-	}
-
-	// add a new request for the virtual object
-	q.Add(reconcile.Request{
+	request := reconcile.Request{
 		NamespacedName: types.NamespacedName{
 			Namespace: obj.GetNamespace(),
 			Name:      obj.GetName(),
 		},
-	})
+	}
+
+	switch eventType {
+	case synccontext.SyncEventTypeCreate:
+		request = toCreateRequest(request)
+	case synccontext.SyncEventTypeUpdate:
+		if !obj.GetDeletionTimestamp().IsZero() {
+			request = toPendingDeleteRequest(request)
+		} else {
+			request = toUpdateRequest(request)
+		}
+	case synccontext.SyncEventTypeDelete:
+		request = toDeleteRequest(request)
+	default:
+	}
+
+	q.Add(request)
 }
 
-func (r *SyncController) enqueuePhysical(ctx context.Context, obj client.Object, q workqueue.TypedRateLimitingInterface[ctrl.Request], isDelete, _ bool) {
+func (r *SyncController) enqueuePhysical(ctx context.Context, obj client.Object, q workqueue.TypedRateLimitingInterface[ctrl.Request], eventType synccontext.SyncEventType) {
 	if obj == nil {
 		return
 	}
+
+	isDelete := eventType == synccontext.SyncEventTypeDelete
 
 	// sync context
 	syncContext := r.newSyncContext(ctx, obj.GetName())
 
 	// we have a physical object here
+	imported := false
 	managed, err := r.syncer.IsManaged(syncContext, obj)
 	if err != nil {
 		klog.Errorf("error checking object %v if managed: %v", obj, err)
 		return
 	} else if !managed {
 		// check if we should import
-		imported := false
 		if importer, ok := r.syncer.(syncertypes.Importer); ok && !isDelete {
 			imported, err = importer.Import(syncContext, obj)
 			if err != nil {
@@ -483,26 +487,40 @@ func (r *SyncController) enqueuePhysical(ctx context.Context, obj client.Object,
 		isDelete = false
 	}
 
-	// add a new request for the virtual object as otherwise this information might be lost after a delete event
-	if isDelete {
-		// add a new request for the host object
-		q.Add(toDeleteRequest(toHostRequest(reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Namespace: obj.GetNamespace(),
-				Name:      obj.GetName(),
-			},
-		})))
-
-		return
-	}
-
-	// add a new request for the host object
-	q.Add(toHostRequest(reconcile.Request{
+	hostRequest := toHostRequest(reconcile.Request{
 		NamespacedName: types.NamespacedName{
 			Namespace: obj.GetNamespace(),
 			Name:      obj.GetName(),
 		},
-	}))
+	})
+
+	switch eventType {
+	case synccontext.SyncEventTypeCreate:
+		if imported {
+			hostRequest = toImportRequest(hostRequest)
+		} else {
+			hostRequest = toCreateRequest(hostRequest)
+		}
+	case synccontext.SyncEventTypeUpdate:
+		if !obj.GetDeletionTimestamp().IsZero() {
+			hostRequest = toPendingDeleteRequest(hostRequest)
+		} else {
+			hostRequest = toUpdateRequest(hostRequest)
+		}
+	case synccontext.SyncEventTypeDelete:
+		if !isDelete {
+			if !obj.GetDeletionTimestamp().IsZero() {
+				hostRequest = toPendingDeleteRequest(hostRequest)
+			} else {
+				hostRequest = toUpdateRequest(hostRequest)
+			}
+		} else {
+			hostRequest = toDeleteRequest(hostRequest)
+		}
+	default:
+	}
+
+	q.Add(hostRequest)
 }
 
 func (r *SyncController) Build(ctx *synccontext.RegisterContext) (controller.Controller, error) {
@@ -619,6 +637,24 @@ func deleteObject(ctx *synccontext.SyncContext, obj client.Object, reason string
 	return ctrl.Result{}, nil
 }
 
+func toCreateRequest(name reconcile.Request) reconcile.Request {
+	return reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: createObjectRequestPrefix + name.Namespace,
+			Name:      name.Name,
+		},
+	}
+}
+
+func toUpdateRequest(name reconcile.Request) reconcile.Request {
+	return reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: updateObjectRequestPrefix + name.Namespace,
+			Name:      name.Name,
+		},
+	}
+}
+
 func toDeleteRequest(name reconcile.Request) reconcile.Request {
 	return reconcile.Request{
 		NamespacedName: types.NamespacedName{
@@ -637,6 +673,15 @@ func toPendingDeleteRequest(name reconcile.Request) reconcile.Request {
 	}
 }
 
+func toImportRequest(name reconcile.Request) reconcile.Request {
+	return reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: importObjectRequestPrefix + name.Namespace,
+			Name:      name.Name,
+		},
+	}
+}
+
 func toHostRequest(name reconcile.Request) reconcile.Request {
 	return reconcile.Request{
 		NamespacedName: types.NamespacedName{
@@ -650,7 +695,25 @@ func isHostRequest(name reconcile.Request) bool {
 	return strings.HasPrefix(name.Namespace, hostObjectRequestPrefix)
 }
 
-func fromDeleteRequest(req reconcile.Request) (reconcile.Request, synccontext.SyncEventType) {
+func extractSyncEventType(req reconcile.Request) (reconcile.Request, synccontext.SyncEventType) {
+	if strings.HasPrefix(req.Namespace, createObjectRequestPrefix) {
+		return reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: strings.TrimPrefix(req.Namespace, createObjectRequestPrefix),
+				Name:      req.Name,
+			},
+		}, synccontext.SyncEventTypeCreate
+	}
+
+	if strings.HasPrefix(req.Namespace, updateObjectRequestPrefix) {
+		return reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: strings.TrimPrefix(req.Namespace, updateObjectRequestPrefix),
+				Name:      req.Name,
+			},
+		}, synccontext.SyncEventTypeUpdate
+	}
+
 	if strings.HasPrefix(req.Namespace, deleteObjectRequestPrefix) {
 		return reconcile.Request{
 			NamespacedName: types.NamespacedName{
@@ -667,6 +730,15 @@ func fromDeleteRequest(req reconcile.Request) (reconcile.Request, synccontext.Sy
 				Name:      req.Name,
 			},
 		}, synccontext.SyncEventTypePendingDelete
+	}
+
+	if strings.HasPrefix(req.Namespace, importObjectRequestPrefix) {
+		return reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: strings.TrimPrefix(req.Namespace, importObjectRequestPrefix),
+				Name:      req.Name,
+			},
+		}, synccontext.SyncEventTypeImport
 	}
 
 	return req, synccontext.SyncEventTypeUnknown
